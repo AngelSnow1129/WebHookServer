@@ -353,7 +353,7 @@ TEST_MYSQL_DSN='root:root@tcp(127.0.0.1:3306)/smsdb_test?parseTime=true&loc=Loca
 
 | 工作流 | 触发条件 | 内容 |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main`、所有 PR、手动 | `gofmt` → `go mod tidy` 幂等性 → `go vet` → `go build` → 单测(`-race -shuffle=on` + 覆盖率)→ **MySQL 8.0 集成测试** → 5 平台交叉编译 |
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main`、所有 PR、手动 | `gofmt` → `go mod tidy` 幂等性 → `go vet` → `go build` → 单测(`-race -shuffle=on` + 覆盖率)→ **MySQL 8.0 集成测试** → 5 平台交叉编译并上传编译产物(Artifacts) |
 | [`release.yml`](.github/workflows/release.yml) | 推送 `v*.*.*` tag、手动 | 发布前门禁 → 5 平台编译并打包 → 生成 `SHA256SUMS` → 创建 GitHub Release → 推送多架构镜像到 GHCR |
 
 CI 显式设置 `GOTOOLCHAIN=local`,禁止自动下载其它 Go 工具链。若 `go.mod` 的 `go` 指令高于实际安装版本,会**明确报错**而不是静默切换版本——这能防止 CI 悄悄改用 Go 1.22 而使前缀路由的兼容性假设失效。
