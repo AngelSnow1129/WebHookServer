@@ -62,8 +62,8 @@ func main() {
 	// 初始化各模块
 	repo := repository.NewSMSRepository(db)
 	otpCache := cache.NewOTPCache(cfg.OTPCacheTTL)
-	svc := service.NewOTPService(repo, otpCache, cfg.HMACSecret)
-	h := handler.NewHandler(svc, cfg.WebhookSecret)
+	svc := service.NewOTPService(repo, otpCache, cfg.HMACSecret, cfg.OTPTemplates)
+	h := handler.NewHandler(svc, cfg.WebhookSecret, cfg.SMSForwardChannels)
 
 	// 启动清理协程
 	ctx, cancel := context.WithCancel(context.Background())
