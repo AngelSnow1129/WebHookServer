@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 项目锁定 Go 1.21.4（见 go.mod）：Go 1.22 的 http.ServeMux 才支持 `{token}`
+  # 通配路由，本项目必须按前缀注册路由，因此不能升 go 指令。
+  # GOTOOLCHAIN=local 禁止自动下载其它工具链，保证 CI 与本地构建行为一致：
+  # 若 go.mod 的版本高于实际安装的 Go，会明确报错而不是静默切换工具链。
+  GOTOOLCHAIN: local
+
+jobs:
+  verify:
+    name: 格式 / 静态检查 / 单测
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt 检查
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt，请执行 gofmt -w ."
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go mod tidy 幂等性
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || { echo "::error::go.mod / go.sum 与 tidy 结果不一致，请本地执行 go mod tidy 后提交"; exit 1; }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: 单元测试（-race + 随机顺序 + 覆盖率）
+        run: |
+          go test -race -shuffle=on -covermode=atomic \
+            -coverprofile="$RUNNER_TEMP/coverage.out" ./...
+
+      - name: 覆盖率汇总
+        run: go tool cover -func="$RUNNER_TEMP/coverage.out" | tail -n 1
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: ${{ runner.temp }}/coverage.out
+          if-no-files-found: ignore
+
+  integration:
+    name: MySQL 集成测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # 用真实 MySQL 8.0 跑集成测试。锁定的关键回归：索引由 AutoMigrate 幂等创建，
+    # 且 created_at 为降序。修复前手写 `CREATE INDEX IF NOT EXISTS` 在 MySQL 上
+    # 必然报 1064 且错误被丢弃，索引从未建成——只有真实数据库才能证明这一点。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: smsdb_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # DSN 指向**专用测试库**：用例会 DropTable 清理残留状态，
+      # 确保“索引是否真的建出来”这一断言不被旧表结构污染。
+      TEST_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/smsdb_test?parseTime=true&loc=Local&charset=utf8mb4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 等待 MySQL 就绪
+        run: |
+          for i in $(seq 1 60); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -proot --silent >/dev/null 2>&1; then
+              echo "MySQL 已就绪（约 $((i * 2))s）"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::等待 MySQL 就绪超时"
+          exit 1
+
+      - name: 集成测试
+        run: go test -tags=integration -race -count=1 -v ./repository/...
+
+  cross-build:
+    name: 交叉编译 ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # 全静态链接：镜像可为 scratch/Alpine，且不受 glibc 版本影响
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -v \
+            -o "$RUNNER_TEMP/sms-server-${{ matrix.goos }}-${{ matrix.goarch }}" .

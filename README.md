@@ -1,5 +1,9 @@
 # SMSServer 短信验证码中继服务
 
+[![CI](https://github.com/AngelSnow1129/WebHookServer/actions/workflows/ci.yml/badge.svg)](https://github.com/AngelSnow1129/WebHookServer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AngelSnow1129/WebHookServer?sort=semver)](https://github.com/AngelSnow1129/WebHookServer/releases)
+[![Go](https://img.shields.io/badge/Go-1.21.4-00ADD8?logo=go)](https://go.dev/)
+
 从短信供应商回调中自动提取验证码并缓存,供调用方轮询获取的服务。调用方无需接入各短信平台的 API,只需接收 webhook 并按手机号取码。
 
 ## 数据流
@@ -38,8 +42,13 @@ SMSServer/
 ├── cache/otp_cache.go               线程安全内存缓存(TTL 过期 + 阅后即焚)
 ├── cache/otp_cache_test.go          TTL、阅后即焚、并发安全测试
 ├── repository/sms_repo.go           MySQL 仓储层(GORM)
+├── repository/integration_test.go   MySQL 集成测试(需 -tags=integration)
 ├── model/sms.go                     数据模型(含索引标签)、HMAC 工具函数
 ├── docs/LOGGING.md                  运行日志规范
+├── .github/workflows/ci.yml         CI:格式/静态检查/单测/集成测试/交叉编译
+├── .github/workflows/release.yml    发布:tag 触发 → Release + GHCR 多架构镜像
+├── Dockerfile                       多阶段构建,distroless 非 root 运行
+├── .dockerignore
 ├── .env.example                     环境变量示例
 ├── .gitignore
 ├── go.mod / go.sum
@@ -98,6 +107,28 @@ go build -o sms-server .
 
 `Ctrl+C`(SIGINT)或 SIGTERM 触发优雅关闭:先停止接收新请求并等待在途 HTTP 请求,再停止清理协程,最后**等待在途短信处理完成**后才退出。
 
+### 3b. 用 Docker 运行
+
+镜像为多阶段构建:构建阶段用 `golang:1.21.4-alpine`,运行阶段用 `gcr.io/distroless/static-debian12:nonroot`。产物是 **CGO 全静态二进制**,因此运行阶段无需 libc;镜像内**没有 shell、没有包管理器**,以非 root(uid 65532)运行。
+
+```bash
+docker build -t sms-server:dev .
+
+docker run -d --name sms-server \
+  -e MYSQL_DSN='root:root@tcp(host.docker.internal:3306)/smsdb?parseTime=true&loc=Local' \
+  -e HMAC_SECRET='至少16位的随机字符串-请务必更换' \
+  -e WEBHOOK_SECRET='至少16位的随机字符串-请务必更换' \
+  -p 53340:53340 \
+  sms-server:dev
+```
+
+| 项 | 说明 |
+|---|---|
+| 注入版本号 | `docker build --build-arg VERSION=v1.0.0 -t sms-server:v1.0.0 .` |
+| 多架构 | `docker buildx build --platform linux/amd64,linux/arm64 .`;Dockerfile 的构建阶段固定在 `$BUILDPLATFORM` 上由 Go 交叉编译,不需要 QEMU 模拟 |
+| 连接宿主机 MySQL | Linux 上用 `--network host` 或宿主机内网 IP;macOS/Windows 用 `host.docker.internal` |
+| 健康检查 | **镜像不含 shell/curl,无法在镜像内做探活**;且服务当前未提供健康检查端点(见「已知限制」),编排层请以端口探测代替 |
+
 ### 4. 验证
 
 ```bash
@@ -118,13 +149,16 @@ curl -s -X POST "http://127.0.0.1:$PORT/api/v1/otp" -d "{\"token\":\"$TOKEN\"}"
 curl -s -X POST "http://127.0.0.1:$PORT/api/v1/otp" -d "{\"token\":\"$TOKEN\"}"
 ```
 
-启动日志中会打印生效配置,便于确认:
+启动日志中会打印版本与生效配置,便于确认:
 
 ```
+[服务] 版本=dev
 [服务] 监听地址: :53340
 [服务] 验证码有效期=5m0s 清理间隔=30s
 [清理] 已启动，间隔=30s
 ```
+
+`版本=dev` 表示本地 `go build` 的产物;正式发布由 CI 通过 `-ldflags "-X main.version=..."` 注入 tag 号,例如 `版本=v1.0.0`。这样线上排查时能直接从首行日志确认部署的是哪个版本。
 
 ## 配置项
 
@@ -267,13 +301,19 @@ KEY `idx_recipient_time` (`recipient`,`created_at` DESC)
 ## 开发
 
 ```bash
-go build ./...         # 编译
+gofmt -l .              # 格式检查(CI 会失败于任何未格式化文件)
 go vet ./...           # 静态检查
-gofmt -l .             # 格式检查
+go build ./...         # 编译
 go test ./...          # 运行全部测试
-go test -race ./...    # 竞态检测
+go test -race -shuffle=on ./...   # 竞态检测 + 随机用例顺序
 go test -cover ./...   # 覆盖率
+
+# MySQL 集成测试(需真实数据库,未设置 DSN 时自动跳过)
+TEST_MYSQL_DSN='root:root@tcp(127.0.0.1:3306)/smsdb_test?parseTime=true&loc=Local&charset=utf8mb4' \
+  go test -tags=integration -race -v ./repository/...
 ```
+
+> 集成测试会先 `DropTable` 清理 `sms_records`,**务必指向专用测试库**,不要指向开发库或生产库。
 
 测试覆盖范围:
 
@@ -283,8 +323,48 @@ go test -cover ./...   # 覆盖率
 | `config` | 默认值、环境变量覆盖、分钟/秒单位正确性、非法值回退 |
 | `handler` | **前缀路由能命中真实密钥**(关键回归)、字面量 `{token}` 被拒、鉴权各分支、非 POST、非法 JSON、超大请求体、`token` 裁剪、响应结构 |
 | `service` | 验证码提取 13 种格式、缓存 key 正确性、无验证码时不写缓存、写库失败语义、阅后即焚、新码覆盖旧码、`WaitInFlight` 在途追踪、清理协程退出 |
+| `repository` | 索引真实建成且 `created_at` 为降序、`AutoMigrate` 幂等、按号码倒序查询往返(需 MySQL) |
 
-`handler` 与 `service` 的测试通过接口注入 `fakeService` / `fakeRepository`,**不需要数据库**;`model`、`repository` 目前无独立测试(均为薄封装,由上述测试间接覆盖)。
+`handler` 与 `service` 的测试通过接口注入 `fakeService` / `fakeRepository`,**不需要数据库**;`model` 为薄封装,由其它包间接覆盖。
+
+## CI/CD
+
+| 工作流 | 触发条件 | 内容 |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | push 到 `main`、所有 PR、手动 | `gofmt` → `go mod tidy` 幂等性 → `go vet` → `go build` → 单测(`-race -shuffle=on` + 覆盖率)→ **MySQL 8.0 集成测试** → 5 平台交叉编译 |
+| [`release.yml`](.github/workflows/release.yml) | 推送 `v*.*.*` tag、手动 | 发布前门禁 → 5 平台编译并打包 → 生成 `SHA256SUMS` → 创建 GitHub Release → 推送多架构镜像到 GHCR |
+
+CI 显式设置 `GOTOOLCHAIN=local`,禁止自动下载其它 Go 工具链。若 `go.mod` 的 `go` 指令高于实际安装版本,会**明确报错**而不是静默切换版本——这能防止 CI 悄悄改用 Go 1.22 而使前缀路由的兼容性假设失效。
+
+### 发布新版本
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+推 tag 后自动完成:门禁校验 → 编译 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64` → 生成校验和 → 创建 Release(含自动生成的变更说明)→ 推送 `ghcr.io/angelsnow1129/webhookserver:1.0.0`(`1.0` 与 `latest` 同时打标)。
+
+> Release 中的产物为 `tar.gz`(Unix)与 `zip`(Windows),附 `checksums.txt`。校验:`sha256sum -c checksums.txt`。
+> 若要为**已存在**的 tag 重新生成产物,用 `gh workflow run release.yml -f tag=v1.0.0`,已存在的 Release 会被覆盖更新。
+
+### 镜像
+
+```bash
+docker pull ghcr.io/angelsnow1129/webhookserver:latest
+```
+
+注意镜像名**全小写**——Docker registry 要求小写,而 GitHub 仓库名保留原始大小写(`AngelSnow1129/WebHookServer`),工作流中已作转换。
+
+## 已知限制
+
+除「安全建议」外,以下与运维相关的缺口尚未补齐:
+
+| 项 | 说明 |
+|---|---|
+| 无健康检查端点 | 未提供 `/healthz` 之类的探活接口,容器编排只能靠端口探测;distroless 镜像内也无 shell 可用 |
+| 写库失败无重试与告警 | 入库失败仅记录日志,无重试、无失败计数、无告警,数据静默丢失 |
+| 无指标与追踪 | 未暴露 Prometheus 指标或分布式追踪,只有文本日志 |
 
 ## 安全建议
 

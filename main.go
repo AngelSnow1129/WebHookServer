@@ -20,7 +20,14 @@ import (
 	"gorm.io/gorm"
 )
 
+// version 由构建时注入（见 .github/workflows/release.yml 的 -ldflags "-X main.version=..."）。
+// 默认 "dev" 使本地 go build 的产物能被明确识别为非正式发布版本。
+var version = "dev"
+
 func main() {
+	// 第一行输出实际运行的版本，便于线上排查「部署的到底是哪个版本」
+	log.Printf("[服务] 版本=%s", version)
+
 	cfg := config.Load()
 
 	// 校验必填配置

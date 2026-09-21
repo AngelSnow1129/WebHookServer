@@ -1,0 +1,215 @@
+name: Release
+
+# 打 tag 即发布：推一个 v*.*.* 形式的 tag 会自动跑门禁、交叉编译、
+# 建 GitHub Release 并把多架构镜像推到 GHCR。
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# workflow_dispatch 用于重建一个已存在的 tag 的产物（不创建新 tag）。
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的 tag（如 v1.0.0），用于重新生成其产物
+        required: true
+        type: string
+
+permissions:
+  contents: write # 创建 Release
+  packages: write # 推送 GHCR 镜像
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false # 发布过程中断比慢更糟
+
+env:
+  GOTOOLCHAIN: local
+  # tag 推送时取 tag 名；手动触发时取输入值
+  VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # 发布前重跑门禁：tag 可能打在从未经过 CI 的提交上，不能假定它已验证
+  verify:
+    name: 发布前门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt / go vet
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt"
+            echo "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+
+      - name: 单元测试
+        run: go test -race -count=1 ./...
+
+  build:
+    name: 编译 ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true # 任一平台编译失败即中止，不发布残缺的产物集
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译并打包
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          binary="sms-server"
+          if [ "${GOOS}" = "windows" ]; then
+            binary="sms-server.exe"
+          fi
+
+          # -s -w 去掉符号表与调试信息；-X 注入版本号，运行时首行日志可见
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "dist/${binary}" .
+
+          name="sms-server_${VERSION}_${GOOS}_${GOARCH}"
+          cd dist
+          if [ "${GOOS}" = "windows" ]; then
+            zip -q "${name}.zip" "${binary}"
+          else
+            tar czf "${name}.tar.gz" "${binary}"
+          fi
+          rm "${binary}"
+          ls -l
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 创建 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0 # --generate-notes 需要完整历史才能列出变更
+
+      - name: 汇总产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 SHA256 校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > checksums.txt
+          cat checksums.txt
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # 重跑同一个 tag 时走覆盖上传，避免因 Release 已存在而失败
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} 已存在，覆盖上传产物"
+            gh release upload "${VERSION}" ./* --clobber
+          else
+            # --verify-tag：tag 必须已存在，避免 gh 擅自基于默认分支打 tag
+            gh release create "${VERSION}" \
+              --title "${VERSION}" \
+              --generate-notes \
+              --verify-tag \
+              ./*
+          fi
+
+  docker:
+    name: 推送多架构镜像到 GHCR
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      # 注意：不使用 QEMU。Dockerfile 的 builder 阶段固定在 $BUILDPLATFORM（runner
+      # 原生 amd64）上，由 Go 交叉编译到 TARGETARCH，所以 arm64 镜像不需要模拟执行。
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名
+        id: image
+        # Docker 镜像名必须全小写，而 github.repository 保留原始大小写
+        # （AngelSnow1129/WebHookServer），直接使用会被 registry 拒绝。
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
